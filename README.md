@@ -1,12 +1,14 @@
 # Storyteller Sync (storytellersync.koplugin)
 
-A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing reading progress with a [Storyteller](https://gitlab.com/storyteller-platform/storyteller) server.
+A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing reading progress with a [Storyteller](https://gitlab.com/storyteller-platform/storyteller) server (2.11.4+).
 
 - Keep your reading progress in sync across all your devices.
 - Seamlessly transition between reading an ebook on KOReader and listening to the readaloud epub on Storyteller app.
 - Easy authentication using a QR code.
 
 ## 💾 Installation
+
+Make sure your Storyteller server version is 2.11.4 or newer. You can check the installed version in the left sidebar under the Logo in WebUI.
 
 1. Copy the plugin folder (`storytellersync.koplugin`) to your KOReader plugins directory:
    - `koreader/plugins/storytellersync.koplugin`
@@ -31,9 +33,10 @@ A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing read
 
 Before syncing, you need to set your Storyteller server URL:
 
-1. Open the **Top Settings menu**.
-2. Go to **Tools** (icon with tools) -> **Storyteller Sync**.
-3. Select **Server URL** and enter your server address (e.g., `https://storyteller.example.com`).
+1. Open the book (make sure it's an EPUB, other formats are not supported)
+2. Open the **Top Settings menu**.
+3. Go to **Tools** (icon with tools) -> **Storyteller Sync**.
+4. Select **Server URL** and enter your server address (e.g., `https://storyteller.example.com`).
 
 ## 🔑 Authentication
 
