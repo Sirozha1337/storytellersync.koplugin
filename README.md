@@ -1,5 +1,7 @@
 # Storyteller Sync (storytellersync.koplugin)
 
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/Sirozha1337/storytellersync.koplugin?style=for-the-badge&color=orange) ![GitHub all releases](https://img.shields.io/github/downloads/Sirozha1337/storytellersync.koplugin/total?style=for-the-badge&color=yellow) ![Platform](https://img.shields.io/badge/Platform-KOReader-success?style=for-the-badge&logo=koreader)
+
 A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing reading progress with a [Storyteller](https://gitlab.com/storyteller-platform/storyteller) server (2.11.4+).
 
 - Keep your reading progress in sync across all your devices.
