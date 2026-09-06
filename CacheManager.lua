@@ -68,7 +68,7 @@ function CacheManager:saveCache(book_path, data)
     -- Add metadata
     data.cached_at = os.time()
     data.last_read_at = os.time()
-    data.cache_version = "1.0"
+    data.cache_version = "1.1"
 
     -- Serialize and write
     local success, err = pcall(function()
@@ -87,7 +87,7 @@ function CacheManager:saveCache(book_path, data)
             return false
         end
 
-        f:write("-- Storyteller Sync Cache v1.0\n")
+        f:write("-- Storyteller Sync Cache v1.1\n")
         f:write("-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n\n")
         f:write("return " .. serialized_data)
         f:close()
@@ -96,12 +96,14 @@ function CacheManager:saveCache(book_path, data)
         return true
     end)
 
-    if not success then
-        logger.warn("CacheManager: Failed to save cache:", err or "unknown error")
+    if not success or err == false then
+        if not success then
+            logger.warn("CacheManager: Failed to save cache:", err or "unknown error")
+        end
         return false
     end
 
-    return success
+    return true
 end
 
 -- Load data from cache
@@ -130,9 +132,9 @@ function CacheManager:loadCache(book_path)
         return nil
     end
 
-    -- Check cache version
-    if data.cache_version ~= "1.0" then
-        logger.warn("CacheManager: Cache version mismatch (got", data.cache_version, ", need 1.0), ignoring")
+    -- Check cache version and ensure spine_meta is present
+    if data.cache_version ~= "1.1" or not data.spine_meta then
+        logger.info("CacheManager: Cache version mismatch or missing spine_meta (got", tostring(data.cache_version), "), ignoring")
         return nil
     end
 

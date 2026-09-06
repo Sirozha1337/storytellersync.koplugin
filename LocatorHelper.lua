@@ -18,9 +18,9 @@ function LocatorHelper.buildEpubSpine(file)
     local CacheManager = require("CacheManager")
     local cache_manager = CacheManager:new()
     local cached_data = cache_manager:loadCache(file)
-    if cached_data and cached_data.epub_spine then
-        logger.dbg("StorytellerSync: buildEpubSpine: loaded spine from cache")
-        return cached_data.epub_spine, cached_data.epub_spine_map
+    if cached_data and cached_data.epub_spine and cached_data.spine_meta then
+        logger.dbg("StorytellerSync: buildEpubSpine: loaded spine and spine_meta from cache")
+        return cached_data.epub_spine, cached_data.epub_spine_map, cached_data.spine_meta
     end
 
     local Archiver = require("ffi/archiver")
@@ -30,15 +30,24 @@ function LocatorHelper.buildEpubSpine(file)
         return nil
     end
 
-    -- ── Scan entries to find the exact container.xml path ────────────────
-    -- (case-insensitive, since some EPUBs capitalise differently)
+    -- ── Scan entries to find container.xml and record uncompressed sizes ─
     local container_path = nil
+    local file_sizes = {}
     for entry in arc:iterate() do
-        logger.dbg("StorytellerSync: buildEpubSpine: entry:", entry.path, "mode:", entry.mode)
         if entry.mode == "file" then
-            local lp = entry.path:lower()
+            local p = entry.path
+            local size_num = tonumber(entry.size) or 0
+            file_sizes[p] = size_num
+            file_sizes[p:lower()] = size_num
+
+            -- Also index stripped leading ./ or /
+            local clean_p = p:gsub("^%./", ""):gsub("^/+", "")
+            file_sizes[clean_p] = size_num
+            file_sizes[clean_p:lower()] = size_num
+
+            local lp = p:lower()
             if lp == "meta-inf/container.xml" or lp:find("container%.xml$") then
-                container_path = entry.path
+                container_path = p
             end
         end
     end
@@ -124,14 +133,45 @@ function LocatorHelper.buildEpubSpine(file)
         return nil
     end
 
-    logger.dbg("StorytellerSync: buildEpubSpine: built spine with", #spine, "items")
+    -- ── 5. Compute Readium synthetic pages & chapter offsets ─────────────
+    local spine_items = {}
+    local total_readium_pages = 0
+    for idx, href in ipairs(spine) do
+        local clean_href = href:gsub("^%./", ""):gsub("^/+", "")
+        local raw_size = file_sizes[clean_href]
+            or file_sizes[clean_href:lower()]
+            or file_sizes[href]
+            or file_sizes[href:lower()]
+        local size = tonumber(raw_size) or 1024
+        local pages = math.max(1, math.ceil(size / 1024))
+        spine_items[idx] = {
+            index = idx,
+            href = href,
+            size = size,
+            pages = pages,
+            start_page = total_readium_pages, -- 0-based synthetic page offset
+        }
+        total_readium_pages = total_readium_pages + pages
+    end
+
+    if total_readium_pages == 0 then
+        total_readium_pages = 1
+    end
+
+    local spine_meta = {
+        total_pages = total_readium_pages,
+        items = spine_items,
+    }
+
+    logger.dbg("StorytellerSync: buildEpubSpine: built spine with", #spine, "items, total Readium pages:", total_readium_pages)
     
     local data_to_save = cached_data or {}
     data_to_save.epub_spine = spine
     data_to_save.epub_spine_map = spine_map
+    data_to_save.spine_meta = spine_meta
     cache_manager:saveCache(file, data_to_save)
 
-    return spine, spine_map
+    return spine, spine_map, spine_meta
 end
 
 local function getCurrentPageHtml(ui)
@@ -202,7 +242,7 @@ function LocatorHelper.getCurrentChapterHref(ui, epub_spine)
     end
 
     -- Ensure spine is available
-    if not epub_spine then
+    if not epub_spine or #epub_spine == 0 then
         logger.dbg("StorytellerSync: getCurrentChapterHref: spine not yet built")
         return nil
     end
@@ -213,9 +253,15 @@ function LocatorHelper.getCurrentChapterHref(ui, epub_spine)
     -- XPointers look like: /body/DocFragment[N]/body/...
     -- N is 1-based and maps directly to the EPUB spine order.
     local frag_idx_str = xpointer:match("^/body/DocFragment%[(%d+)%]")
-    if not frag_idx_str then return nil end
-
     local frag_idx = tonumber(frag_idx_str)
+
+    -- Handle single-chapter EPUBs where DocFragment might not be prefixed
+    if not frag_idx and #epub_spine == 1 then
+        frag_idx = 1
+    end
+
+    if not frag_idx then return nil end
+
     local href = epub_spine[frag_idx]
     if not href then
         logger.warn("StorytellerSync: getCurrentChapterHref: no spine entry for DocFragment", frag_idx)
@@ -246,23 +292,83 @@ function LocatorHelper.getPageCount(ui)
 end
 
 --- Build a Readium locator for the current position.
+-- @tparam table ui KOReader UI context
+-- @tparam table epub_spine Array of spine hrefs
+-- @tparam table|nil spine_meta Readium synthetic page metadata from buildEpubSpine
 -- @treturn table|nil Readium locator or nil if we can't determine position
-function LocatorHelper.buildCurrentLocator(ui, epub_spine)
-    local fragment_id = LocatorHelper.getCurrentFragmentId(ui)
-    local href = LocatorHelper.getCurrentChapterHref(ui, epub_spine) or ""
-    local percentage = LocatorHelper.getLastPercent(ui)
+function LocatorHelper.buildCurrentLocator(ui, epub_spine, spine_meta)
+    if not ui or not ui.document then return nil end
 
-    logger.dbg("StorytellerSync: [Build] Fragment ID:", fragment_id, "Href:", href, "Percentage:", percentage)
-    -- We need at minimum a percentage to send
-    if not percentage then return nil end
+    local fragment_id = LocatorHelper.getCurrentFragmentId(ui)
+
+    local xpointer = ui.document:getXPointer()
+    local frag_idx_str = xpointer and xpointer:match("^/body/DocFragment%[(%d+)%]")
+    local frag_idx = tonumber(frag_idx_str)
+
+    -- Handle single-chapter EPUBs or fallback
+    if not frag_idx and epub_spine and #epub_spine == 1 then
+        frag_idx = 1
+    end
+
+    local href = (frag_idx and epub_spine and epub_spine[frag_idx]) or ""
+
+    local total_progression = nil
+    local in_chapter_progression = nil
+    local position = nil
+
+    if spine_meta and spine_meta.items and spine_meta.total_pages and frag_idx and spine_meta.items[frag_idx] then
+        local item_meta = spine_meta.items[frag_idx]
+
+        -- Calculate rendered chapter page boundaries via getPageFromXPointer
+        local start_page = ui.document:getPageFromXPointer("/body/DocFragment[" .. frag_idx .. "]") or 1
+        local next_page
+        if epub_spine and frag_idx < #epub_spine then
+            next_page = ui.document:getPageFromXPointer("/body/DocFragment[" .. (frag_idx + 1) .. "]")
+        end
+        if not next_page or next_page <= start_page then
+            next_page = (ui.document.info.number_of_pages or 1) + 1
+        end
+
+        local chapter_pages = math.max(1, next_page - start_page)
+        local current_page = ui.document:getCurrentPage() or 1
+        local intra_page_pos = (ui.paging and ui.paging.getPagePosition and ui.paging:getPagePosition(current_page)) or 0
+
+        local p = ((current_page - start_page) + intra_page_pos) / chapter_pages
+        p = math.max(0, math.min(1, p))
+
+        local continuous_pos = item_meta.start_page + p * item_meta.pages
+        total_progression = math.max(0, math.min(1, continuous_pos / spine_meta.total_pages))
+        in_chapter_progression = p
+        position = math.floor(continuous_pos) + 1
+    else
+        logger.dbg("StorytellerSync: [Build] Not using spine_meta, falling back to global KOReader percent")
+
+        -- Fallback to global KOReader percent if spine_meta is unavailable
+        total_progression = LocatorHelper.getLastPercent(ui)
+        in_chapter_progression = total_progression
+    end
+
+    logger.dbg("StorytellerSync: [Build] Fragment ID:", fragment_id, "Href:", href,
+               "TotalProgression:", total_progression, "Progression:", in_chapter_progression, "Position:", position)
+
+    -- We need at minimum a totalProgression to send
+    if not total_progression then return nil end
 
     local locator = {
         href = href,
         type = "application/xhtml+xml",
         locations = {
-            totalProgression = percentage,
+            totalProgression = total_progression,
         },
     }
+
+    if in_chapter_progression then
+        locator.locations.progression = in_chapter_progression
+    end
+
+    if position then
+        locator.locations.position = position
+    end
 
     if fragment_id then
         locator.locations.fragments = { fragment_id }
@@ -270,6 +376,55 @@ function LocatorHelper.buildCurrentLocator(ui, epub_spine)
     end
 
     return locator
+end
+
+--- Resolve a Readium locator to a target page number in KOReader using chapter href and progression.
+-- @tparam table locator The Readium locator object
+-- @tparam table ui KOReader UI context
+-- @tparam table epub_spine Array of spine hrefs
+-- @tparam table epub_spine_map Reverse map of href -> index
+-- @treturn number|nil Target page number (1-based) or nil if cannot resolve
+function LocatorHelper.getPageFromLocator(locator, ui, epub_spine, epub_spine_map)
+    if not locator or not ui or not ui.document then return nil end
+
+    local frag_idx = nil
+
+    if locator.href and epub_spine_map then
+        frag_idx = epub_spine_map[locator.href]
+        if not frag_idx then
+            local clean_href = locator.href:gsub("^%./", ""):gsub("^/+", "")
+            frag_idx = epub_spine_map[clean_href]
+                or epub_spine_map[clean_href:lower()]
+                or epub_spine_map[locator.href:lower()]
+        end
+    end
+
+    -- Single-chapter book fallback
+    if not frag_idx and epub_spine and #epub_spine == 1 then
+        frag_idx = 1
+    end
+
+    if not frag_idx then return nil end
+
+    local start_page = ui.document:getPageFromXPointer("/body/DocFragment[" .. frag_idx .. "]") or 1
+    local next_page
+    if epub_spine and frag_idx < #epub_spine then
+        next_page = ui.document:getPageFromXPointer("/body/DocFragment[" .. (frag_idx + 1) .. "]")
+    end
+    if not next_page or next_page <= start_page then
+        next_page = (ui.document.info.number_of_pages or 1) + 1
+    end
+
+    local chapter_pages = math.max(1, next_page - start_page)
+    local p = locator.locations and locator.locations.progression
+    p = math.max(0, math.min(1, tonumber(p) or 0))
+
+    local page_offset = math.min(chapter_pages - 1, math.floor(p * chapter_pages))
+    local target_page = start_page + page_offset
+    local max_pages = ui.document.info.number_of_pages or target_page
+    target_page = math.max(1, math.min(max_pages, target_page))
+    logger.dbg("LocatorHelper: getPageFromLocator -> href:", locator.href, "p:", p, "start_page:", start_page, "chapter_pages:", chapter_pages, "target_page:", target_page)
+    return target_page
 end
 
 --- Create an XPath for navigation from a locator object.

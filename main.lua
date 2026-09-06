@@ -7,35 +7,27 @@ using fragment-based (sentence span ID) positioning.
 @module koplugin.StorytellerSync
 ]]--
 
-local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
-local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
-local Math = require("optmath")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
-local time = require("ui/time")
 local _ = require("gettext")
 local T = require("ffi/util").template
+
 local LocatorHelper = require("LocatorHelper")
-local Api = require("StorytellerApi")
-local StorytellerBookLink = require("StorytellerBookLink")
 local StorytellerAuth = require("StorytellerAuth")
+local StorytellerBookLink = require("StorytellerBookLink")
+local StorytellerSyncEngine = require("StorytellerSyncEngine")
 
 local StorytellerSync = WidgetContainer:extend{
     name = "storytellersync",
     is_doc_only = true,
 
-    -- Debounce state
-    push_timestamp = nil,
-    pull_timestamp = nil,
-    page_update_counter = nil,
-    last_page = nil,
-    periodic_push_task = nil,
-    periodic_push_scheduled = nil,
+    -- Sync engine instance
+    engine = nil,
 
     -- Device auth polling state
     device_auth_polling = false,
@@ -44,6 +36,7 @@ local StorytellerSync = WidgetContainer:extend{
     -- EPUB spine: array of href strings, index = DocFragment index (1-based)
     _epub_spine = nil,
     _epub_spine_map = nil,
+    _epub_spine_meta = nil,
 
     settings = nil,
 }
@@ -53,8 +46,6 @@ local SYNC_STRATEGY = {
     SILENT  = 2,
     DISABLE = 3,
 }
-
-local API_CALL_DEBOUNCE_DELAY = time.s(25)
 
 StorytellerSync.default_settings = {
     server_url = nil,
@@ -66,19 +57,9 @@ StorytellerSync.default_settings = {
 }
 
 function StorytellerSync:init()
-    self.push_timestamp = 0
-    self.pull_timestamp = 0
-    self.page_update_counter = 0
-    self.last_page = -1
-    self.periodic_push_scheduled = false
-
-    self.periodic_push_task = function()
-        self.periodic_push_scheduled = false
-        self.page_update_counter = 0
-        self:updateProgress(false, false)
-    end
-
     self.settings = G_reader_settings:readSetting("storyteller_sync", self.default_settings)
+    self.engine = StorytellerSyncEngine:new(self)
+    self.engine:init()
     self.ui.menu:registerToMainMenu(self)
 end
 
@@ -173,6 +154,13 @@ function StorytellerSync:getSubMenuItems()
             separator = true,
         },
         {
+            text = _("Sync now"),
+            enabled_func = function() return self:isLoggedIn() end,
+            callback = function()
+                self:sync()
+            end,
+        },
+        {
             text = _("Push progress now"),
             enabled_func = function() return self:isLoggedIn() end,
             callback = function()
@@ -206,7 +194,6 @@ function StorytellerSync:getSubMenuItems()
         },
     }
 end
-
 
 -- ────────────────────────────────────────────────────────────
 -- Settings dialogs
@@ -247,262 +234,24 @@ function StorytellerSync:showServerUrlDialog()
 end
 
 -- ────────────────────────────────────────────────────────────
--- Sync logic helpers
+-- Sync delegate methods
 -- ────────────────────────────────────────────────────────────
 
-function StorytellerSync:_checkSyncPrerequisites(interactive, type)
-    if not self:isLoggedIn() then
-        if interactive then
-            UIManager:show(InfoMessage:new{
-                text = _("Please login first."),
-                timeout = 3,
-            })
-        end
-        return false
+function StorytellerSync:sync()
+    if self.engine then
+        self.engine:syncFull(true, true)
     end
-
-    local now = UIManager:getElapsedTimeSinceBoot()
-    local last_timestamp = (type == "push") and self.push_timestamp or self.pull_timestamp
-    if not interactive and now - last_timestamp <= API_CALL_DEBOUNCE_DELAY then
-        logger.dbg("StorytellerSync: " .. type .. " debounced")
-        return false
-    end
-
-    return true, now
 end
-
--- ────────────────────────────────────────────────────────────
--- Sync: Push (KOReader → Storyteller)
--- ────────────────────────────────────────────────────────────
 
 function StorytellerSync:updateProgress(ensure_networking, interactive)
-    local ok_pre, now = self:_checkSyncPrerequisites(interactive, "push")
-    if not ok_pre then return end
-
-    if ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:updateProgress(ensure_networking, interactive) end) then
-        return
+    if self.engine then
+        self.engine:pushProgress(interactive, false)
     end
-
-    StorytellerBookLink.resolveBookUuid(self, function(book_uuid)
-        if not book_uuid then
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
-                    timeout = 5,
-                })
-            end
-            return
-        end
-
-        local locator = LocatorHelper.buildCurrentLocator(self.ui, self._epub_spine)
-        if not locator then
-            logger.warn("StorytellerSync: Could not build locator")
-            return
-        end
-
-        if LocatorHelper.locatorsEqual(locator, self.last_synced_locator) then
-            logger.dbg("StorytellerSync: Position unchanged. Skipping push.")
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("Position hasn't changed. Skipping sync."),
-                    timeout = 3,
-                })
-            end
-            return
-        end
-
-        local timestamp = os.time() * 1000 -- milliseconds
-
-        local ok, data, code = Api:updatePosition(
-            self.settings.server_url,
-            self.settings.auth_token,
-            book_uuid,
-            locator,
-            timestamp
-        )
-
-        logger.dbg("StorytellerSync: [Push]", ok, data, code)
-
-        if ok then
-            self.last_synced_locator = locator
-        end
-
-        if interactive then
-            if ok then
-                UIManager:show(InfoMessage:new{
-                    text = _("Progress pushed."),
-                    timeout = 3,
-                })
-            elseif code == 409 then
-                UIManager:show(InfoMessage:new{
-                    text = _("Server has a newer position. Pull first."),
-                    timeout = 3,
-                })
-            else
-                UIManager:show(InfoMessage:new{
-                    text = T(_("Sync error: %1"), data or "unknown"),
-                    timeout = 3,
-                })
-            end
-        end
-    end)
-
-    self.push_timestamp = now
 end
-
--- ────────────────────────────────────────────────────────────
--- Sync: Pull (Storyteller → KOReader)
--- ────────────────────────────────────────────────────────────
 
 function StorytellerSync:getProgress(ensure_networking, interactive)
-    local ok_pre, now = self:_checkSyncPrerequisites(interactive, "pull")
-    if not ok_pre then return end
-
-    if ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:getProgress(ensure_networking, interactive) end) then
-        return
-    end
-
-    StorytellerBookLink.resolveBookUuid(self, function(book_uuid)
-        if not book_uuid then
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
-                    timeout = 5,
-                })
-            end
-            return
-        end
-
-        local ok, data = Api:getPosition(
-            self.settings.server_url,
-            self.settings.auth_token,
-            book_uuid
-        )
-
-        if not ok or not data then
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("No progress found on server."),
-                    timeout = 3,
-                })
-            end
-            return
-        end
-
-        local remote_locator = data.locator
-        if not remote_locator then
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("No position data on server."),
-                    timeout = 3,
-                })
-            end
-            return
-        end
-
-        -- Check if the remote fragment is already visible on the current page
-        local remote_xpath = LocatorHelper.createXPathFromLocator(remote_locator, self._epub_spine_map)
-        if remote_xpath and self.ui.document:isXPointerInCurrentPage(remote_xpath) then
-            logger.dbg("StorytellerSync: [Pull] Remote fragment", remote_xpath, "is on current page.")
-            if interactive then
-                UIManager:show(InfoMessage:new{
-                    text = _("Already in sync."),
-                    timeout = 3,
-                })
-            end
-            return
-        end
-
-        -- Compare with current position
-        local current_percent = LocatorHelper.getLastPercent(self.ui)
-        local remote_percent = remote_locator.locations and remote_locator.locations.totalProgression
-
-        logger.dbg("StorytellerSync: [Pull] Current percent:", current_percent, "Remote percent:", remote_percent)
-
-        if remote_percent and current_percent then
-            -- Calculate sensitivity based on page count (threshold = 2 pages)
-            local total_pages = LocatorHelper.getPageCount(self.ui)
-            local threshold = 0.005
-            if total_pages and total_pages > 0 then
-                threshold = 2 / total_pages
-            end
-            logger.dbg("StorytellerSync: [Pull] Sync threshold:", threshold, "(total pages:", total_pages, ")")
-
-            -- Consider "same" if within the threshold
-            if math.abs(remote_percent - current_percent) < threshold then
-                if interactive then
-                    UIManager:show(InfoMessage:new{
-                        text = _("Already in sync."),
-                        timeout = 3,
-                    })
-                end
-                return
-            end
-        end
-
-        -- Determine forward/backward
-        local is_forward = true
-        if remote_percent and current_percent then
-            is_forward = (remote_percent > current_percent)
-        end
-
-        local strategy = is_forward and self.settings.sync_forward or self.settings.sync_backward
-        if strategy == SYNC_STRATEGY.DISABLE then
-            return
-        end
-
-        local function doSync()
-            self:syncToRemoteLocator(remote_locator, remote_xpath)
-            self.last_synced_locator = LocatorHelper.buildCurrentLocator(self.ui, self._epub_spine)
-            UIManager:show(InfoMessage:new{
-                text = _("Progress synchronized."),
-                timeout = 3,
-            })
-        end
-
-        if interactive or strategy == SYNC_STRATEGY.SILENT then
-            doSync()
-        elseif strategy == SYNC_STRATEGY.PROMPT then
-            local percent_display = remote_percent and Math.round(remote_percent * 100) or "?"
-            UIManager:show(ConfirmBox:new{
-                text = T(_("Sync to %1% from Storyteller?"), percent_display),
-                ok_callback = doSync,
-            })
-        end
-    end)
-
-    self.pull_timestamp = now
-end
-
---- Navigate to a remote Readium locator position.
-function StorytellerSync:syncToRemoteLocator(locator, xpath)
-    logger.dbg("StorytellerSync: syncToRemoteLocator: locator:", locator, ", xpath: ", xpath)
-    if not xpath then return end
-
-    -- Try fragment-based navigation via ReaderLink.
-    -- CREngine's internal anchor format is "#elementId". We pass it through
-    -- self.ui.link:onGotoLink() so it goes through isXPointerInDocument
-    -- validation and fires GotoXPointer correctly.
-    local navigated = false
-
-    if xpath then
-        logger.dbg("StorytellerSync: Navigating via xpath:", xpath)
-
-        if self.ui.link and self.ui.document:isXPointerInDocument(xpath) then
-            self.ui.link:onGotoLink({ xpointer = xpath }, true) -- neglect_current_location=true
-            navigated = true
-        else
-            logger.warn("StorytellerSync: XPath not found in document:", xpath)
-        end
-    end
-
-    if not navigated then
-        -- Fallback: percentage-based navigation
-        local total_progression = locator.locations and locator.locations.totalProgression
-        if total_progression then
-            logger.dbg("StorytellerSync: Navigating via percentage:", total_progression * 100)
-            self.ui:handleEvent(Event:new("GotoPercent", total_progression * 100))
-        end
+    if self.engine then
+        self.engine:pullProgress(interactive, ensure_networking)
     end
 end
 
@@ -516,11 +265,9 @@ function StorytellerSync:onReaderReady()
         return
     end
 
-    self.last_page = self.ui:getCurrentPage()
     self:registerEvents()
 
     if self:isLoggedIn() then
-        -- Auto-link book on open if not already linked
         StorytellerBookLink.resolveBookUuid(self, function(uuid)
             if uuid then
                 logger.info("StorytellerSync: Book auto-linked:", uuid)
@@ -528,47 +275,31 @@ function StorytellerSync:onReaderReady()
         end)
     end
 
-    -- Build the EPUB spine index→href map for getCurrentChapterHref().
-    -- Only meaningful for reflowable (non-page) EPUB documents.
+    -- Build the EPUB spine index→href map and Readium synthetic page metadata
     self._epub_spine = nil
     self._epub_spine_map = nil
+    self._epub_spine_meta = nil
     if self.ui.document and not self.ui.document.info.has_pages then
         local file = self.ui.document.file
         if file and file:lower():match("%.epub$") then
-            self._epub_spine, self._epub_spine_map = LocatorHelper.buildEpubSpine(file)
+            self._epub_spine, self._epub_spine_map, self._epub_spine_meta = LocatorHelper.buildEpubSpine(file)
             if self._epub_spine then
-                logger.dbg("StorytellerSync: Spine ready, items:", #self._epub_spine)
+                logger.dbg("StorytellerSync: Spine ready, items:", #self._epub_spine,
+                           "Readium synthetic pages:", self._epub_spine_meta and self._epub_spine_meta.total_pages)
             else
                 logger.warn("StorytellerSync: Could not build EPUB spine for:", file)
             end
         end
     end
 
-    self.last_synced_locator = LocatorHelper.buildCurrentLocator(self.ui, self._epub_spine)
-
-    if self.settings.auto_sync and self:isLoggedIn() then
-        UIManager:nextTick(function()
-            self:getProgress(true, false)
-        end)
+    if self.engine then
+        self.engine:handleReaderReady()
     end
 end
 
-function StorytellerSync:schedulePeriodicPush()
-    UIManager:unschedule(self.periodic_push_task)
-    UIManager:scheduleIn(10, self.periodic_push_task)
-    self.periodic_push_scheduled = true
-end
-
 function StorytellerSync:_onPageUpdate(page)
-    if page == nil then return end
-
-    if self.last_page ~= page then
-        self.last_page = page
-        self.page_update_counter = self.page_update_counter + 1
-        if self.periodic_push_scheduled or
-           (self.settings.pages_before_update and self.page_update_counter >= self.settings.pages_before_update) then
-            self:schedulePeriodicPush()
-        end
+    if self.engine then
+        self.engine:handlePageUpdate(page)
     end
 end
 
@@ -577,45 +308,30 @@ function StorytellerSync:_onCloseDocument()
     self.onResume = nil
     self.onSuspend = nil
 
-    if not self:isLoggedIn() then return end
-
-    local book_uuid = self.ui.doc_settings:readSetting("storyteller_book_uuid")
-    if not book_uuid then return end
-
-    local locator = LocatorHelper.buildCurrentLocator(self.ui, self._epub_spine)
-    if not locator then return end
-
-    if LocatorHelper.locatorsEqual(locator, self.last_synced_locator) then
-        logger.dbg("StorytellerSync: Position unchanged since open/sync. Skipping push on close.")
-        return
+    if self.engine then
+        self.engine:handleCloseDocument()
     end
-
-    local server_url = self.settings.server_url
-    local auth_token = self.settings.auth_token
-    local timestamp = os.time() * 1000
-
-    NetworkMgr:goOnlineToRun(function()
-        Api:updatePosition(server_url, auth_token, book_uuid, locator, timestamp)
-    end)
 end
 
 function StorytellerSync:_onResume()
     logger.dbg("StorytellerSync: onResume")
-    UIManager:scheduleIn(1, function()
-        self:getProgress(true, false)
-    end)
+    if self.engine then
+        self.engine:handleResume()
+    end
 end
 
 function StorytellerSync:_onSuspend()
     logger.dbg("StorytellerSync: onSuspend")
-    self:updateProgress(true, false)
+    if self.engine then
+        self.engine:handleSuspend()
+    end
 end
 
 function StorytellerSync:_onNetworkConnected()
     logger.dbg("StorytellerSync: onNetworkConnected")
-    UIManager:scheduleIn(0.5, function()
-        self:getProgress(false, false)
-    end)
+    if self.engine then
+        self.engine:handleNetworkConnected()
+    end
 end
 
 function StorytellerSync:registerEvents()
@@ -635,8 +351,9 @@ function StorytellerSync:registerEvents()
 end
 
 function StorytellerSync:onCloseWidget()
-    UIManager:unschedule(self.periodic_push_task)
-    self.periodic_push_task = nil
+    if self.engine then
+        self.engine:cleanup()
+    end
     if self.device_auth_poll_task then
         UIManager:unschedule(self.device_auth_poll_task)
         self.device_auth_polling = false
