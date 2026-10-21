@@ -1,8 +1,9 @@
 --[[--
-Storyteller Sync Engine - Sync Coordinator & State Machine
+Storyteller Sync Engine - Sync Coordinator & State Machine (Progress API v3)
 
 Manages synchronization lifecycle, debouncing, concurrency locking,
-offline queue draining, conflict resolution, and position navigation.
+confirmed/unconfirmed state tracking, offline queue draining,
+conflict resolution (200 / 201 / 409), and CREngine XPointer navigation.
 
 @module StorytellerSyncEngine
 ]]--
@@ -40,12 +41,18 @@ function StorytellerSyncEngine:new(plugin)
         is_syncing = false,
         sync_again = false,
 
-        -- State tracking
-        last_synced_locator = nil,
+        -- v3 State tracking
+        last_synced_progress = nil,
+        pending_progress_doc = nil,
+        last_page_turn_iso = nil,
+        book_format = nil,
+        is_confirmed = true,
+
         push_timestamp = 0,
         pull_timestamp = 0,
         page_update_counter = 0,
         last_page = -1,
+        last_xpointer = nil,
         periodic_push_scheduled = false,
         periodic_push_task = nil,
     }
@@ -59,6 +66,11 @@ function StorytellerSyncEngine:init()
     self.pull_timestamp = 0
     self.page_update_counter = 0
     self.last_page = -1
+    self.last_xpointer = nil
+    self.last_page_turn_iso = nil
+    self.pending_progress_doc = nil
+    self.book_format = nil
+    self.is_confirmed = true
     self.periodic_push_scheduled = false
     self.is_syncing = false
     self.sync_again = false
@@ -92,6 +104,23 @@ function StorytellerSyncEngine:schedulePeriodicPush()
     self.periodic_push_scheduled = true
 end
 
+--- Record a local navigation event at the exact moment the user arrives at a page/position.
+function StorytellerSyncEngine:_recordLocalNavigation()
+    local ui = self.plugin.ui
+    if not ui or not ui.document then return end
+
+    self.last_page_turn_iso = LocatorHelper.formatIso8601()
+    local doc, fmt = LocatorHelper.buildProgressDocument(ui, self.last_page_turn_iso)
+    if doc then
+        self.pending_progress_doc = doc
+        self.book_format = fmt
+        self.last_xpointer = LocatorHelper.extractCrengineXPointer(doc)
+        if not LocatorHelper.positionsEqual(doc, self.last_synced_progress) then
+            self.is_confirmed = false
+        end
+    end
+end
+
 -- ────────────────────────────────────────────────────────────
 -- Lifecycle Event Handlers
 -- ────────────────────────────────────────────────────────────
@@ -101,7 +130,23 @@ function StorytellerSyncEngine:handleReaderReady()
     if not ui then return end
 
     self.last_page = ui:getCurrentPage()
-    self.last_synced_locator = LocatorHelper.buildCurrentLocator(ui, self.plugin._epub_spine, self.plugin._epub_spine_meta)
+    self.last_page_turn_iso = LocatorHelper.formatIso8601()
+    local initial_doc, fmt = LocatorHelper.buildProgressDocument(ui, self.last_page_turn_iso)
+    self.last_synced_progress = initial_doc
+    self.pending_progress_doc = initial_doc
+    self.book_format = fmt
+    self.last_xpointer = initial_doc and LocatorHelper.extractCrengineXPointer(initial_doc)
+
+    -- Check if there is an unconfirmed offline queue entry for this book
+    local book_uuid = ui.doc_settings and ui.doc_settings:readSetting("storyteller_book_uuid")
+    local queued = book_uuid and StorytellerQueue:peek(book_uuid)
+    if queued and queued.progress_doc then
+        self.pending_progress_doc = queued.progress_doc
+        self.book_format = queued.format or self.book_format
+        self.is_confirmed = false
+    else
+        self.is_confirmed = true
+    end
 
     if self.plugin.settings.auto_sync and self.plugin:isLoggedIn() then
         UIManager:nextTick(function()
@@ -115,11 +160,35 @@ function StorytellerSyncEngine:handlePageUpdate(page)
 
     if self.last_page ~= page then
         self.last_page = page
-        self.page_update_counter = self.page_update_counter + 1
+        self:_recordLocalNavigation()
 
-        local pages_threshold = self.plugin.settings.pages_before_update
-        if self.periodic_push_scheduled or (pages_threshold and self.page_update_counter >= pages_threshold) then
-            self:schedulePeriodicPush()
+        if self.plugin.settings.auto_sync then
+            self.page_update_counter = self.page_update_counter + 1
+            local pages_threshold = self.plugin.settings.pages_before_update
+            if self.periodic_push_scheduled or (pages_threshold and self.page_update_counter >= pages_threshold) then
+                self:schedulePeriodicPush()
+            end
+        end
+    end
+end
+
+function StorytellerSyncEngine:handlePosUpdate(_pos, page)
+    local ui = self.plugin.ui
+    if not ui or not ui.document then return end
+
+    local current_xp = LocatorHelper.getCurrentXPointer(ui)
+    if current_xp and current_xp ~= self.last_xpointer then
+        if page then
+            self.last_page = page
+        end
+        self:_recordLocalNavigation()
+
+        if self.plugin.settings.auto_sync then
+            self.page_update_counter = self.page_update_counter + 1
+            local pages_threshold = self.plugin.settings.pages_before_update
+            if self.periodic_push_scheduled or (pages_threshold and self.page_update_counter >= pages_threshold) then
+                self:schedulePeriodicPush()
+            end
         end
     end
 end
@@ -172,20 +241,41 @@ function StorytellerSyncEngine:drainQueue()
     local auth_token = self.plugin.settings.auth_token
 
     return StorytellerQueue:drain(function(item)
-        local ok, _data, code = Api:updatePosition(
+        local ok, _data, code = Api:updateProgress(
             server_url,
             auth_token,
             item.book_uuid,
-            item.locator,
-            item.timestamp
+            item.progress_doc,
+            item.format
         )
         return ok, code
     end)
 end
 
+--- Get the current local progress document and format, preserving arrival timestamp.
+function StorytellerSyncEngine:_getActiveLocalProgress()
+    local ui = self.plugin.ui
+    if not ui or not ui.document then return nil, nil end
+
+    local current_xp = LocatorHelper.getCurrentXPointer(ui)
+    local pending_xp = self.pending_progress_doc and LocatorHelper.extractCrengineXPointer(self.pending_progress_doc)
+
+    if self.pending_progress_doc and current_xp and pending_xp == current_xp then
+        return self.pending_progress_doc, (self.book_format or LocatorHelper.detectBookFormat(ui))
+    end
+
+    local doc, fmt = LocatorHelper.buildProgressDocument(ui, self.last_page_turn_iso)
+    if doc then
+        self.pending_progress_doc = doc
+        self.book_format = fmt
+    end
+    return doc, fmt
+end
+
 --- Unified full synchronization pipeline:
 -- 1. Drains offline queued items (Push)
--- 2. Pulls latest remote position (Pull)
+-- 2. If current document has unconfirmed local changes, pushes to server first
+-- 3. Pulls latest remote progression (Pull)
 function StorytellerSyncEngine:syncFull(interactive, ensure_networking)
     if self.is_syncing then
         logger.dbg("StorytellerSyncEngine: syncFull already in progress, setting sync_again")
@@ -220,32 +310,51 @@ function StorytellerSyncEngine:syncFull(interactive, ensure_networking)
         -- Step 1: Drain offline queue
         self:drainQueue()
 
-        -- Step 2: If current document has pending un-synced local changes, push first
+        -- Step 2: If current document has unconfirmed local changes, push first
         local ui = self.plugin.ui
         if ui and ui.doc_settings then
-            local current_locator = LocatorHelper.buildCurrentLocator(ui, self.plugin._epub_spine, self.plugin._epub_spine_meta)
-            if current_locator and not LocatorHelper.locatorsEqual(current_locator, self.last_synced_locator) then
+            local current_doc, format = self:_getActiveLocalProgress()
+            if current_doc and (not self.is_confirmed or not LocatorHelper.positionsEqual(current_doc, self.last_synced_progress)) then
                 local book_uuid = ui.doc_settings:readSetting("storyteller_book_uuid")
                 if book_uuid then
-                    logger.dbg("StorytellerSyncEngine: Flushing uncommitted local progress before pull")
-                    local timestamp = os.time() * 1000
-                    local ok_push, _data, code = Api:updatePosition(
+                    logger.dbg("StorytellerSyncEngine: Flushing unconfirmed local progress before pull")
+                    local ok_push, _data, code = Api:updateProgress(
                         self.plugin.settings.server_url,
                         self.plugin.settings.auth_token,
                         book_uuid,
-                        current_locator,
-                        timestamp
+                        current_doc,
+                        format
                     )
+                    if not ok_push and code == 404 and format ~= "ebook" then
+                        format = "ebook"
+                        self.book_format = "ebook"
+                        if ui.document then
+                            ui.document._storyteller_book_format = "ebook"
+                        end
+                        ok_push, _data, code = Api:updateProgress(
+                            self.plugin.settings.server_url,
+                            self.plugin.settings.auth_token,
+                            book_uuid,
+                            current_doc,
+                            format
+                        )
+                    end
                     if ok_push then
-                        self.last_synced_locator = current_locator
+                        -- 200 (matches latest) or 201 (saved new)
+                        self.last_synced_progress = current_doc
+                        self.is_confirmed = true
+                        StorytellerQueue:remove(book_uuid)
                     elseif code == 409 then
                         logger.dbg("StorytellerSyncEngine: Server has newer position (409 Conflict)")
+                        self.is_confirmed = true
+                        StorytellerQueue:remove(book_uuid)
                     else
-                        -- Save to queue so uncommitted change isn't lost if pull fails
+                        -- Network or 5xx error: save to queue so unconfirmed change isn't lost
+                        self.is_confirmed = false
                         StorytellerQueue:push({
                             book_uuid = book_uuid,
-                            locator = current_locator,
-                            timestamp = timestamp,
+                            progress_doc = current_doc,
+                            format = format,
                         })
                     end
                 end
@@ -293,14 +402,14 @@ function StorytellerSyncEngine:pushProgress(interactive, force)
     local ui = self.plugin.ui
     if not ui then return end
 
-    local locator = LocatorHelper.buildCurrentLocator(ui, self.plugin._epub_spine, self.plugin._epub_spine_meta)
-    if not locator then
-        logger.warn("StorytellerSyncEngine: Could not build locator")
+    local progress_doc, format = self:_getActiveLocalProgress()
+    if not progress_doc then
+        logger.warn("StorytellerSyncEngine: Could not build v3 progress document")
         return
     end
 
-    if LocatorHelper.locatorsEqual(locator, self.last_synced_locator) then
-        logger.dbg("StorytellerSyncEngine: Position unchanged. Skipping push.")
+    if self.is_confirmed and LocatorHelper.positionsEqual(progress_doc, self.last_synced_progress) then
+        logger.dbg("StorytellerSyncEngine: Position confirmed and unchanged. Skipping push.")
         if interactive then
             UIManager:show(InfoMessage:new{
                 text = _("Position hasn't changed. Skipping sync."),
@@ -329,39 +438,59 @@ function StorytellerSyncEngine:pushProgress(interactive, force)
         end
 
         if not NetworkMgr:isOnline() and not interactive then
-            -- Queue offline
+            -- Queue offline with original arrival timestamp preserved
+            self.is_confirmed = false
             StorytellerQueue:push({
                 book_uuid = book_uuid,
-                locator = locator,
-                timestamp = os.time() * 1000,
+                progress_doc = progress_doc,
+                format = format,
             })
             return
         end
 
-        local timestamp = os.time() * 1000
-        local ok, data, code = Api:updatePosition(
+        local ok, data, code = Api:updateProgress(
             self.plugin.settings.server_url,
             self.plugin.settings.auth_token,
             book_uuid,
-            locator,
-            timestamp
+            progress_doc,
+            format
         )
+        if not ok and code == 404 and format ~= "ebook" then
+            format = "ebook"
+            self.book_format = "ebook"
+            if ui.document then
+                ui.document._storyteller_book_format = "ebook"
+            end
+            ok, data, code = Api:updateProgress(
+                self.plugin.settings.server_url,
+                self.plugin.settings.auth_token,
+                book_uuid,
+                progress_doc,
+                format
+            )
+        end
 
-        logger.dbg("StorytellerSyncEngine: [Push]", ok, data, code)
+        logger.dbg("StorytellerSyncEngine: [Push v3]", ok, data, code)
 
         if ok then
-            self.last_synced_locator = locator
+            -- 200 (already latest) or 201 (saved new)
+            self.last_synced_progress = progress_doc
+            self.is_confirmed = true
             self.push_timestamp = now
+            StorytellerQueue:remove(book_uuid)
         elseif code == 409 then
-            -- Server position is newer, trigger a pull
+            -- Server position is newer, mark confirmed and trigger a pull
             logger.info("StorytellerSyncEngine: Server has newer position (409). Triggering pull.")
+            self.is_confirmed = true
+            StorytellerQueue:remove(book_uuid)
             self:pullProgress(interactive, false)
         else
-            -- Offline or network error: save to queue
+            -- Offline or network/server 5xx error: keep unconfirmed and save to queue
+            self.is_confirmed = false
             StorytellerQueue:push({
                 book_uuid = book_uuid,
-                locator = locator,
-                timestamp = timestamp,
+                progress_doc = progress_doc,
+                format = format,
             })
         end
 
@@ -438,13 +567,27 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             return
         end
 
-        local ok, data, code = Api:getPosition(
+        local ui = self.plugin.ui
+        local format = (ui and LocatorHelper.detectBookFormat(ui)) or self.book_format or "ebook"
+
+        local ok, data, code = Api:getProgress(
             self.plugin.settings.server_url,
             self.plugin.settings.auth_token,
-            book_uuid
+            book_uuid,
+            format
         )
 
-        if not ok or not data then
+        -- If format=readaloud returned 404 (e.g. server only has ebook format), retry with ebook
+        if not ok and code == 404 and format ~= "ebook" then
+            ok, data, code = Api:getProgress(
+                self.plugin.settings.server_url,
+                self.plugin.settings.auth_token,
+                book_uuid,
+                "ebook"
+            )
+        end
+
+        if not ok or type(data) ~= "table" then
             if interactive then
                 UIManager:show(InfoMessage:new{
                     text = (not ok and code ~= 404)
@@ -457,8 +600,7 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             return
         end
 
-        local remote_locator = data.locator
-        if not remote_locator then
+        if not data.references and not data.progression then
             if interactive then
                 UIManager:show(InfoMessage:new{
                     text = _("No position data on server."),
@@ -471,17 +613,17 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
 
         self.pull_timestamp = now
 
-        local ui = self.plugin.ui
         if not ui or not ui.document then
             finish()
             return
         end
 
-        -- Check if the remote fragment is already visible on the current page
-        local remote_xpath = LocatorHelper.createXPathFromLocator(remote_locator, self.plugin._epub_spine_map)
-        if remote_xpath and ui.document:isXPointerInCurrentPage(remote_xpath) then
-            logger.dbg("StorytellerSyncEngine: [Pull] Remote fragment", remote_xpath, "is on current page.")
-            self.last_synced_locator = remote_locator
+        -- Resolve remote CREngine XPointer in the local document (handles both ebook and readaloud DOMs)
+        local remote_xp = LocatorHelper.resolveXPointerInDocument(data, ui)
+        if remote_xp and ui.document:isXPointerInCurrentPage(remote_xp) then
+            logger.dbg("StorytellerSyncEngine: [Pull v3] Remote XPointer", remote_xp, "is on current page.")
+            self.last_synced_progress = data
+            self.is_confirmed = true
             if interactive then
                 UIManager:show(InfoMessage:new{
                     text = _("Already in sync."),
@@ -492,28 +634,24 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             return
         end
 
-        -- Resolve remote target page
+        -- Resolve remote target page via CREngine XPointer
         local current_page = ui.document:getCurrentPage()
-        local remote_target_page = LocatorHelper.getPageFromLocator(
-            remote_locator,
-            ui,
-            self.plugin._epub_spine,
-            self.plugin._epub_spine_map
-        )
+        local remote_target_page = remote_xp and ui.document:getPageFromXPointer(remote_xp)
 
-        -- Compare with current position percentage (Readium-aligned)
-        local current_locator = LocatorHelper.buildCurrentLocator(ui, self.plugin._epub_spine, self.plugin._epub_spine_meta)
-        local current_percent = (current_locator and current_locator.locations and current_locator.locations.totalProgression)
-            or LocatorHelper.getLastPercent(ui)
-        local remote_percent = remote_locator.locations and remote_locator.locations.totalProgression
+        local current_percent = LocatorHelper.getLastPercent(ui)
+        local remote_percent = tonumber(data.progression)
 
-        logger.dbg("StorytellerSyncEngine: [Pull] Current page:", current_page, "Remote target page:", remote_target_page,
-                   "Current percent:", current_percent, "Remote percent:", remote_percent)
+        logger.dbg("StorytellerSyncEngine: [Pull v3] Current page:", current_page,
+                   "Remote target page:", remote_target_page,
+                   "Current percent:", current_percent,
+                   "Remote percent:", remote_percent,
+                   "Remote XPointer:", remote_xp)
 
         if remote_target_page and current_page then
             if remote_target_page == current_page then
-                logger.dbg("StorytellerSyncEngine: [Pull] Remote target page", remote_target_page, "is current page. Already in sync.")
-                self.last_synced_locator = remote_locator
+                logger.dbg("StorytellerSyncEngine: [Pull v3] Remote target page", remote_target_page, "is current page. Already in sync.")
+                self.last_synced_progress = data
+                self.is_confirmed = true
                 if interactive then
                     UIManager:show(InfoMessage:new{
                         text = _("Already in sync."),
@@ -529,7 +667,8 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             local threshold = 0.5 / total_pages
 
             if math.abs(remote_percent - current_percent) < threshold then
-                self.last_synced_locator = remote_locator
+                self.last_synced_progress = data
+                self.is_confirmed = true
                 if interactive then
                     UIManager:show(InfoMessage:new{
                         text = _("Already in sync."),
@@ -556,8 +695,17 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
         end
 
         local function doSync()
-            self:syncToRemoteLocator(remote_locator, remote_xpath)
-            self.last_synced_locator = LocatorHelper.buildCurrentLocator(ui, self.plugin._epub_spine, self.plugin._epub_spine_meta)
+            self:syncToRemoteProgress(data, remote_xp)
+            self.last_page = ui.document:getCurrentPage()
+            self.last_page_turn_iso = data.modified or LocatorHelper.formatIso8601()
+            local updated_doc, fmt = LocatorHelper.buildProgressDocument(ui, self.last_page_turn_iso)
+            self.last_synced_progress = updated_doc or data
+            self.pending_progress_doc = updated_doc or data
+            self.book_format = fmt or self.book_format
+            self.last_xpointer = updated_doc and LocatorHelper.extractCrengineXPointer(updated_doc) or remote_xp
+            self.is_confirmed = true
+            StorytellerQueue:remove(book_uuid)
+
             UIManager:show(InfoMessage:new{
                 text = _("Progress synchronized."),
                 timeout = 3,
@@ -569,8 +717,14 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             doSync()
         elseif strategy == SYNC_STRATEGY.PROMPT then
             local percent_display = remote_percent and Math.round(remote_percent * 100) or "?"
+            local prompt_text
+            if data.title and data.title ~= "" then
+                prompt_text = T(_("Sync to %1% (%2) from Storyteller?"), percent_display, data.title)
+            else
+                prompt_text = T(_("Sync to %1% from Storyteller?"), percent_display)
+            end
             UIManager:show(ConfirmBox:new{
-                text = T(_("Sync to %1% from Storyteller?"), percent_display),
+                text = prompt_text,
                 ok_callback = doSync,
                 cancel_callback = finish,
             })
@@ -580,42 +734,33 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
     end)
 end
 
---- Navigate reader to remote Readium locator.
-function StorytellerSyncEngine:syncToRemoteLocator(locator, xpath)
+--- Navigate reader to remote v3 progression document.
+-- @tparam table progress_doc v3 Progression Document
+-- @tparam string|nil resolved_xp Resolved CREngine XPointer
+function StorytellerSyncEngine:syncToRemoteProgress(progress_doc, resolved_xp)
     local ui = self.plugin.ui
-    if not ui then return end
+    if not ui or not ui.document then return end
 
-    logger.dbg("StorytellerSyncEngine: syncToRemoteLocator: locator:", locator, ", xpath:", xpath)
+    logger.dbg("StorytellerSyncEngine: syncToRemoteProgress: resolved_xp:", resolved_xp,
+               "progression:", progress_doc and progress_doc.progression)
 
-    local navigated = false
-    if xpath and ui.link and ui.document:isXPointerInDocument(xpath) then
-        logger.dbg("StorytellerSyncEngine: Navigating via xpath:", xpath)
-        ui.link:onGotoLink({ xpointer = xpath }, true)
-        navigated = true
+    if resolved_xp and ui.document:isXPointerInDocument(resolved_xp) then
+        logger.dbg("StorytellerSyncEngine: Navigating via GotoXPointer:", resolved_xp)
+        if ui.link then
+            ui.link:addCurrentLocationToStack()
+        end
+        ui:handleEvent(Event:new("GotoXPointer", resolved_xp, resolved_xp))
+        return
     end
 
-    if not navigated then
-        local target_page = LocatorHelper.getPageFromLocator(
-            locator,
-            ui,
-            self.plugin._epub_spine,
-            self.plugin._epub_spine_map
-        )
-        if target_page then
-            logger.dbg("StorytellerSyncEngine: Navigating to resolved chapter page:", target_page)
-            ui:handleEvent(Event:new("GotoPage", target_page))
-            navigated = true
+    local total_progression = progress_doc and tonumber(progress_doc.progression)
+    if total_progression then
+        logger.dbg("StorytellerSyncEngine: Fallback navigating via GotoPercent:", total_progression * 100)
+        if ui.link then
+            ui.link:addCurrentLocationToStack()
         end
-    end
-
-    if not navigated then
-        local total_progression = locator.locations and locator.locations.totalProgression
-        if total_progression then
-            logger.dbg("StorytellerSyncEngine: Fallback navigating via percentage:", total_progression * 100)
-            ui:handleEvent(Event:new("GotoPercent", total_progression * 100))
-        end
+        ui:handleEvent(Event:new("GotoPercent", total_progression * 100))
     end
 end
 
 return StorytellerSyncEngine
-

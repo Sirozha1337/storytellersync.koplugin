@@ -2,22 +2,19 @@
 Storyteller Sync plugin for KOReader.
 
 Synchronizes reading progress between KOReader and a Storyteller server
-using fragment-based (sentence span ID) positioning.
+using Progress API v3 (OPDS Progression v1.0) with native CREngine XPointers.
 
 @module koplugin.StorytellerSync
 ]]--
 
-local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
-local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
-local LocatorHelper = require("LocatorHelper")
 local StorytellerAuth = require("StorytellerAuth")
 local StorytellerBookLink = require("StorytellerBookLink")
 local StorytellerSyncEngine = require("StorytellerSyncEngine")
@@ -32,11 +29,6 @@ local StorytellerSync = WidgetContainer:extend{
     -- Device auth polling state
     device_auth_polling = false,
     device_auth_poll_task = nil,
-
-    -- EPUB spine: array of href strings, index = DocFragment index (1-based)
-    _epub_spine = nil,
-    _epub_spine_map = nil,
-    _epub_spine_meta = nil,
 
     settings = nil,
 }
@@ -275,23 +267,6 @@ function StorytellerSync:onReaderReady()
         end)
     end
 
-    -- Build the EPUB spine index→href map and Readium synthetic page metadata
-    self._epub_spine = nil
-    self._epub_spine_map = nil
-    self._epub_spine_meta = nil
-    if self.ui.document and not self.ui.document.info.has_pages then
-        local file = self.ui.document.file
-        if file and file:lower():match("%.epub$") then
-            self._epub_spine, self._epub_spine_map, self._epub_spine_meta = LocatorHelper.buildEpubSpine(file)
-            if self._epub_spine then
-                logger.dbg("StorytellerSync: Spine ready, items:", #self._epub_spine,
-                           "Readium synthetic pages:", self._epub_spine_meta and self._epub_spine_meta.total_pages)
-            else
-                logger.warn("StorytellerSync: Could not build EPUB spine for:", file)
-            end
-        end
-    end
-
     if self.engine then
         self.engine:handleReaderReady()
     end
@@ -300,6 +275,12 @@ end
 function StorytellerSync:_onPageUpdate(page)
     if self.engine then
         self.engine:handlePageUpdate(page)
+    end
+end
+
+function StorytellerSync:_onPosUpdate(pos, page)
+    if self.engine then
+        self.engine:handlePosUpdate(pos, page)
     end
 end
 
@@ -335,15 +316,18 @@ function StorytellerSync:_onNetworkConnected()
 end
 
 function StorytellerSync:registerEvents()
+    -- Always track page/pos updates so `modified` reflects the exact time the user arrived at the page,
+    -- even if they later trigger a manual "Push progress now" or "Sync now".
+    self.onPageUpdate = self._onPageUpdate
+    self.onPosUpdate = self._onPosUpdate
+
     if self.settings.auto_sync then
         self.onCloseDocument = self._onCloseDocument
-        self.onPageUpdate = self._onPageUpdate
         self.onResume = self._onResume
         self.onSuspend = self._onSuspend
         self.onNetworkConnected = self._onNetworkConnected
     else
         self.onCloseDocument = nil
-        self.onPageUpdate = nil
         self.onResume = nil
         self.onSuspend = nil
         self.onNetworkConnected = nil

@@ -2,15 +2,26 @@
 
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/Sirozha1337/storytellersync.koplugin?style=for-the-badge&color=orange) ![GitHub all releases](https://img.shields.io/github/downloads/Sirozha1337/storytellersync.koplugin/total?style=for-the-badge&color=yellow) ![Platform](https://img.shields.io/badge/Platform-KOReader-success?style=for-the-badge&logo=koreader)
 
-A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing reading progress with a [Storyteller](https://gitlab.com/storyteller-platform/storyteller) server (2.11.4+).
+A [KOReader](https://github.com/koreader/koreader) plugin for synchronizing reading progress with a [Storyteller](https://gitlab.com/storyteller-platform/storyteller) server.
 
 - Keep your reading progress in sync across all your devices.
 - Seamlessly transition between reading an ebook on KOReader and listening to the readaloud epub on Storyteller app.
 - Easy authentication using a QR code.
 
-## 💾 Installation
+## 📋 Compatibility & Book File Requirements
 
-Make sure your Storyteller server version is 2.11.4 or newer. You can check the installed version in the left sidebar under the Logo in WebUI.
+### Plugin v2.0.0-beta+ (Storyteller v3.0.0-beta.55+)
+- **Server Compatibility**: Supports **Storyteller v3.0.0-beta.55+**.
+- **Original EPUB Support**: Allows you to sync progress between the **original (text-only) EPUB** file on KOReader and the **Readaloud** on Storyteller.
+- **Requirement**: Both files (the original EPUB and the Readaloud) must be uploaded/present on your Storyteller server.
+
+### Plugin v1.x (Prior to v2)
+- **Server Compatibility**: Compatible with **Storyteller v2.11.4+**.
+- **Same File Requirement**: Requires you to have the **same Readaloud EPUB file** on both devices.
+- **💡 Workaround to reduce file size**: Since Readaloud files include audio and can be very large, you can open the Readaloud `.epub` as a `.zip` archive and delete the `Audio` folder inside it before transferring it to KOReader.
+
+
+## 💾 Installation
 
 1. Copy the plugin folder (`storytellersync.koplugin`) to your KOReader plugins directory:
    - `koreader/plugins/storytellersync.koplugin`
@@ -20,8 +31,9 @@ Make sure your Storyteller server version is 2.11.4 or newer. You can check the 
    - `StorytellerApi.lua`
    - `StorytellerAuth.lua`
    - `StorytellerBookLink.lua`
+   - `StorytellerQueue.lua`
+   - `StorytellerSyncEngine.lua`
    - `LocatorHelper.lua`
-   - `CacheManager.lua`
 
 ## ▶️ Enabling the plugin
 

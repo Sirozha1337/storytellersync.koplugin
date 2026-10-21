@@ -46,9 +46,9 @@ end
 
 --- Queue a progress update for later retry.
 -- Deduplicates by book_uuid so only the newest position is kept per book.
--- @tparam table item { book_uuid = string, locator = table, timestamp = number }
+-- @tparam table item { book_uuid = string, progress_doc = table, format = string }
 function StorytellerQueue:push(item)
-    if not item or not item.book_uuid or not item.locator then
+    if not item or not item.book_uuid or not item.progress_doc then
         logger.warn("StorytellerQueue: invalid item to push")
         return
     end
@@ -61,7 +61,8 @@ function StorytellerQueue:push(item)
     for _, entry in ipairs(queue) do
         local is_same_book = (entry.book_uuid == item.book_uuid)
         local is_expired = (now - (entry.queued_at or 0)) >= MAX_AGE
-        if not is_same_book and not is_expired then
+        local is_valid_v3 = (type(entry.progress_doc) == "table")
+        if not is_same_book and not is_expired and is_valid_v3 then
             table.insert(filtered, entry)
         end
     end
@@ -76,6 +77,29 @@ function StorytellerQueue:push(item)
     logger.dbg("StorytellerQueue: queued progress for book:", item.book_uuid, "queue total:", #filtered)
 end
 
+--- Remove any queued progress update for a specific book UUID.
+-- @tparam string book_uuid
+function StorytellerQueue:remove(book_uuid)
+    if not book_uuid then return end
+    local queue = self:load()
+    if #queue == 0 then return end
+
+    local filtered = {}
+    local removed = false
+    for _, entry in ipairs(queue) do
+        if entry.book_uuid == book_uuid then
+            removed = true
+        else
+            table.insert(filtered, entry)
+        end
+    end
+
+    if removed then
+        self:save(filtered)
+        logger.dbg("StorytellerQueue: removed confirmed book from queue:", book_uuid)
+    end
+end
+
 --- Attempt to send all queued items in order.
 -- @tparam function send_func function(item) -> bool success, int http_status_code
 -- @treturn number Number of successfully processed/cleared items
@@ -87,23 +111,29 @@ function StorytellerQueue:drain(send_func)
     local processed = 0
 
     for i, item in ipairs(queue) do
-        local ok, code = send_func(item)
-        local is_permanent = type(code) == "number" and (code >= 400 and code < 500 and code ~= 429)
-        if ok or is_permanent then
-            -- Success or permanent status (409 conflict, 404 not found, 401 unauth, other 4xx errors)
-            if not ok and code ~= 409 then
-                logger.warn("StorytellerQueue: dropping queued item due to permanent client error:", code, item.book_uuid)
-            end
+        -- Drop legacy v2 queue items that lack progress_doc
+        if type(item.progress_doc) ~= "table" then
+            logger.info("StorytellerQueue: dropping legacy v2 queued item for book:", item.book_uuid)
             processed = processed + 1
         else
-            -- Network error or temporary server 5xx: keep this and all subsequent items
-            local remaining = {}
-            for j = i, #queue do
-                table.insert(remaining, queue[j])
+            local ok, code = send_func(item)
+            local is_permanent = type(code) == "number" and (code >= 400 and code < 500 and code ~= 429)
+            if ok or is_permanent then
+                -- Success (200/201) or permanent status (409 conflict, 404 not found, 401 unauth, other 4xx errors)
+                if not ok and code ~= 409 then
+                    logger.warn("StorytellerQueue: dropping queued item due to permanent client error:", code, item.book_uuid)
+                end
+                processed = processed + 1
+            else
+                -- Network error or temporary server 5xx: keep this and all subsequent items
+                local remaining = {}
+                for j = i, #queue do
+                    table.insert(remaining, queue[j])
+                end
+                self:save(remaining)
+                logger.info("StorytellerQueue: processed", processed, ", remaining in queue:", #remaining)
+                return processed
             end
-            self:save(remaining)
-            logger.info("StorytellerQueue: processed", processed, ", remaining in queue:", #remaining)
-            return processed
         end
     end
 
@@ -120,7 +150,7 @@ function StorytellerQueue:peek(book_uuid)
     if not book_uuid then return nil end
     local queue = self:load()
     for _, entry in ipairs(queue) do
-        if entry.book_uuid == book_uuid then
+        if entry.book_uuid == book_uuid and type(entry.progress_doc) == "table" then
             return entry
         end
     end
@@ -136,4 +166,3 @@ function StorytellerQueue:clear()
 end
 
 return StorytellerQueue
-

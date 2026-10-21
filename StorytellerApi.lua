@@ -145,35 +145,38 @@ function StorytellerApi:getBooks(server_url, token)
     return httpRequest(url, "GET", headers, nil, API_TIMEOUTS)
 end
 
---- Fetch the current reading position for a book.
--- GET /api/v2/books/{bookUuid}/positions
+local DEFAULT_FORMAT = "ebook"
+
+--- Fetch the current reading progression for a book.
+-- GET /api/v3/books/{bookUuid}/progress?format={format}
 -- @string server_url Base URL
 -- @string token Bearer token
 -- @string book_uuid UUID of the book
+-- @string[opt="ebook"] format Publication format ("ebook", "readaloud", "audiobook")
 -- @treturn bool success
--- @treturn table|string Position data {locator, timestamp} or error
-function StorytellerApi:getPosition(server_url, token, book_uuid)
-    local url = buildUrl(server_url, "/api/v2/books/" .. book_uuid .. "/positions")
+-- @treturn table|string Progression document or error message
+-- @treturn int HTTP status code
+function StorytellerApi:getProgress(server_url, token, book_uuid, format)
+    local fmt = format or DEFAULT_FORMAT
+    local url = buildUrl(server_url, "/api/v3/books/" .. book_uuid .. "/progress?format=" .. fmt)
     local headers = commonHeaders(token)
     return httpRequest(url, "GET", headers, nil, API_TIMEOUTS)
 end
 
---- Update the reading position for a book.
--- POST /api/v2/books/{bookUuid}/positions
+--- Update the reading progression for a book.
+-- POST /api/v3/books/{bookUuid}/progress?format={format}
 -- @string server_url Base URL
 -- @string token Bearer token
 -- @string book_uuid UUID of the book
--- @table locator Readium locator object
--- @number timestamp Unix timestamp in milliseconds
--- @treturn bool success
--- @treturn table|string Response data or error
--- @treturn int HTTP status code (409 = conflict, position is older)
-function StorytellerApi:updatePosition(server_url, token, book_uuid, locator, timestamp)
-    local url = buildUrl(server_url, "/api/v2/books/" .. book_uuid .. "/positions")
-    local body = JSON.encode({
-        locator = locator,
-        timestamp = timestamp,
-    })
+-- @table progress_doc Progression document {modified, device, progression, references, title?}
+-- @string[opt="ebook"] format Publication format ("ebook", "readaloud", "audiobook")
+-- @treturn bool success (true for 200 and 201)
+-- @treturn table|string Response data or error message
+-- @treturn int HTTP status code (200 = matches latest, 201 = saved, 409 = server has newer)
+function StorytellerApi:updateProgress(server_url, token, book_uuid, progress_doc, format)
+    local fmt = format or DEFAULT_FORMAT
+    local url = buildUrl(server_url, "/api/v3/books/" .. book_uuid .. "/progress?format=" .. fmt)
+    local body = JSON.encode(progress_doc)
     local headers = commonHeaders(token)
     headers["content-type"] = "application/json"
     return httpRequest(url, "POST", headers, body, API_TIMEOUTS)
