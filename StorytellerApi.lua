@@ -56,12 +56,12 @@ local function httpRequest(url, method, headers, body, timeouts)
        code == socketutil.SSL_HANDSHAKE_CODE or
        code == socketutil.SINK_TIMEOUT_CODE then
         logger.warn("StorytellerApi: request interrupted:", code)
-        return false, "Network timeout", code
+        return false, "Network timeout", nil
     end
 
     if resp_headers == nil then
         logger.warn("StorytellerApi: no HTTP headers:", status or code)
-        return false, "Network or server unavailable", code
+        return false, "Network or server unavailable", nil
     end
 
     local content = table.concat(sink)
@@ -78,6 +78,7 @@ local function httpRequest(url, method, headers, body, timeouts)
         end
     end
 
+    code = tonumber(code)
     if not code or code < 200 or code > 299 then
         local err_msg = "HTTP error " .. tostring(code)
         if type(parsed) == "table" and parsed.error then

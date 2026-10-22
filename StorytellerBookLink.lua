@@ -21,7 +21,7 @@ function StorytellerBookLink.resolveBookUuid(plugin, callback)
     local ok, books = Api:getBooks(plugin.settings.server_url, plugin.settings.auth_token)
     if not ok or type(books) ~= "table" then
         logger.warn("StorytellerSync: Failed to fetch books:", books)
-        callback(nil)
+        callback(nil, books or "Network error")
         return
     end
 

@@ -265,7 +265,7 @@ function StorytellerSyncEngine:syncFull(interactive, ensure_networking)
     end)
 
     if not ok then
-        logger.error("StorytellerSyncEngine: syncFull encountered error:", err)
+        logger.err("StorytellerSyncEngine: syncFull encountered error:", err)
         self.is_syncing = false
     end
 end
@@ -316,11 +316,12 @@ function StorytellerSyncEngine:pushProgress(interactive, force)
         return
     end
 
-    StorytellerBookLink.resolveBookUuid(self.plugin, function(book_uuid)
+    StorytellerBookLink.resolveBookUuid(self.plugin, function(book_uuid, err)
         if not book_uuid then
             if interactive then
                 UIManager:show(InfoMessage:new{
-                    text = _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
+                    text = err and T(_("Sync error: %1"), err)
+                        or _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
                     timeout = 5,
                 })
             end
@@ -424,11 +425,12 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
         return
     end
 
-    StorytellerBookLink.resolveBookUuid(self.plugin, function(book_uuid)
+    StorytellerBookLink.resolveBookUuid(self.plugin, function(book_uuid, err)
         if not book_uuid then
             if interactive then
                 UIManager:show(InfoMessage:new{
-                    text = _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
+                    text = err and T(_("Sync error: %1"), err)
+                        or _("This book is not linked to a Storyteller book. Use 'Link this book' from the menu."),
                     timeout = 5,
                 })
             end
@@ -436,7 +438,7 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
             return
         end
 
-        local ok, data = Api:getPosition(
+        local ok, data, code = Api:getPosition(
             self.plugin.settings.server_url,
             self.plugin.settings.auth_token,
             book_uuid
@@ -445,7 +447,9 @@ function StorytellerSyncEngine:pullProgress(interactive, ensure_networking, on_f
         if not ok or not data then
             if interactive then
                 UIManager:show(InfoMessage:new{
-                    text = _("No progress found on server."),
+                    text = (not ok and code ~= 404)
+                        and T(_("Sync error: %1"), data or "unknown")
+                        or _("No progress found on server."),
                     timeout = 3,
                 })
             end

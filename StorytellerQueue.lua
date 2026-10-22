@@ -88,7 +88,7 @@ function StorytellerQueue:drain(send_func)
 
     for i, item in ipairs(queue) do
         local ok, code = send_func(item)
-        local is_permanent = code and (code >= 400 and code < 500 and code ~= 429)
+        local is_permanent = type(code) == "number" and (code >= 400 and code < 500 and code ~= 429)
         if ok or is_permanent then
             -- Success or permanent status (409 conflict, 404 not found, 401 unauth, other 4xx errors)
             if not ok and code ~= 409 then
