@@ -241,7 +241,7 @@ function StorytellerSyncEngine:drainQueue()
     local auth_token = self.plugin.settings.auth_token
 
     return StorytellerQueue:drain(function(item)
-        local ok, _data, code = Api:updateProgress(
+        local ok, _data, code = Api:updateProgressWithFallback(
             server_url,
             auth_token,
             item.book_uuid,
@@ -318,26 +318,19 @@ function StorytellerSyncEngine:syncFull(interactive, ensure_networking)
                 local book_uuid = ui.doc_settings:readSetting("storyteller_book_uuid")
                 if book_uuid then
                     logger.dbg("StorytellerSyncEngine: Flushing unconfirmed local progress before pull")
-                    local ok_push, _data, code = Api:updateProgress(
+                    local ok_push, _data, code, used_fmt = Api:updateProgressWithFallback(
                         self.plugin.settings.server_url,
                         self.plugin.settings.auth_token,
                         book_uuid,
                         current_doc,
                         format
                     )
-                    if not ok_push and code == 404 and format ~= "ebook" then
-                        format = "ebook"
-                        self.book_format = "ebook"
+                    if used_fmt and used_fmt ~= format then
+                        format = used_fmt
+                        self.book_format = used_fmt
                         if ui.document then
-                            ui.document._storyteller_book_format = "ebook"
+                            ui.document._storyteller_book_format = used_fmt
                         end
-                        ok_push, _data, code = Api:updateProgress(
-                            self.plugin.settings.server_url,
-                            self.plugin.settings.auth_token,
-                            book_uuid,
-                            current_doc,
-                            format
-                        )
                     end
                     if ok_push then
                         -- 200 (matches latest) or 201 (saved new)
@@ -448,29 +441,22 @@ function StorytellerSyncEngine:pushProgress(interactive, force)
             return
         end
 
-        local ok, data, code = Api:updateProgress(
+        local ok, data, code, used_fmt = Api:updateProgressWithFallback(
             self.plugin.settings.server_url,
             self.plugin.settings.auth_token,
             book_uuid,
             progress_doc,
             format
         )
-        if not ok and code == 404 and format ~= "ebook" then
-            format = "ebook"
-            self.book_format = "ebook"
+        if used_fmt and used_fmt ~= format then
+            format = used_fmt
+            self.book_format = used_fmt
             if ui.document then
-                ui.document._storyteller_book_format = "ebook"
+                ui.document._storyteller_book_format = used_fmt
             end
-            ok, data, code = Api:updateProgress(
-                self.plugin.settings.server_url,
-                self.plugin.settings.auth_token,
-                book_uuid,
-                progress_doc,
-                format
-            )
         end
 
-        logger.dbg("StorytellerSyncEngine: [Push v3]", ok, data, code)
+        logger.dbg("StorytellerSyncEngine: [Push v3]", format, ok, data, code)
 
         if ok then
             -- 200 (already latest) or 201 (saved new)

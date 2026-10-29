@@ -79,6 +79,16 @@ function LocatorHelper.getCurrentChapterTitle(ui)
     return nil
 end
 
+--- Check whether an HTML fragment contains Storyteller readaloud sentence spans
+-- (<span id="{chapterId}-s{N}">). Generic markers such as epub:type are NOT
+-- sufficient: nearly every commercial EPUB uses them.
+-- @tparam string html
+-- @treturn boolean
+function LocatorHelper.hasReadaloudMarkup(html)
+    if type(html) ~= "string" then return false end
+    return html:find('id="[^"]*%-s%d+"') ~= nil
+end
+
 --- Detect whether the currently open EPUB is a Storyteller readaloud EPUB or a standard ebook.
 -- Storyteller readaloud EPUBs mark up sentences with <span id="{chapterId}-s{N}">.
 -- Result is cached on the document instance so detection runs at most once per page until found.
@@ -106,7 +116,7 @@ function LocatorHelper.detectBookFormat(ui)
                 ok_html, html = pcall(ui.document.getHTMLFromXPointer, ui.document, xp_start, 0)
             end
             if ok_html and type(html) == "string" then
-                if html:find('id="[^"]*%-s%d+"') or html:find("epub:type=\"[^\"]*\"") or html:find("%-st%-") then
+                if LocatorHelper.hasReadaloudMarkup(html) then
                     ui.document._storyteller_book_format = "readaloud"
                     logger.dbg("StorytellerSync: Detected book format: readaloud")
                     return "readaloud"
