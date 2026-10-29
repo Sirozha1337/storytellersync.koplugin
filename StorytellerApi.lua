@@ -182,4 +182,35 @@ function StorytellerApi:updateProgress(server_url, token, book_uuid, progress_do
     return httpRequest(url, "POST", headers, body, API_TIMEOUTS)
 end
 
+--- Update progression, retrying as "ebook" when the server could not interpret
+-- the position for the requested format. The server answers 404 for unknown
+-- formats, but for an unresolvable position it stores the raw reference and
+-- answers 201 with no "#char=" reference, so that case is treated as a miss too.
+-- @treturn bool success
+-- @treturn table|string Response data or error message
+-- @treturn int HTTP status code
+-- @treturn string Format that was finally used
+function StorytellerApi:updateProgressWithFallback(server_url, token, book_uuid, progress_doc, format)
+    local fmt = format or DEFAULT_FORMAT
+    local ok, data, code = self:updateProgress(server_url, token, book_uuid, progress_doc, fmt)
+    if fmt ~= "ebook" then
+        local unresolved = false
+        if ok and type(data) == "table" and type(data.references) == "table" then
+            unresolved = true
+            for _, ref in ipairs(data.references) do
+                if type(ref) == "string" and ref:find("#char=", 1, true) then
+                    unresolved = false
+                    break
+                end
+            end
+        end
+        if (not ok and code == 404) or unresolved then
+            logger.info("StorytellerApi: format", fmt, "not usable (", code, "); retrying as ebook")
+            ok, data, code = self:updateProgress(server_url, token, book_uuid, progress_doc, "ebook")
+            fmt = "ebook"
+        end
+    end
+    return ok, data, code, fmt
+end
+
 return StorytellerApi
